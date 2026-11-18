@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ops Bridge Console</title>
+  <meta name="description" content="Triage FAL incidents, act on them through RBAC-governed ITSM tools, and watch the resilience layer recover from injected faults.">
+  <link rel="stylesheet" href="/static/console.css">
+</head>
+<body>
+  <header class="strip">
+    <div class="brand">
+      <span class="brand-name">Ops Bridge</span>
+      <span class="brand-sub">FAL incident console</span>
+    </div>
+
+    <div class="role" role="radiogroup" aria-labelledby="role-label">
+      <span id="role-label" class="role-label">Act as</span>
+      <button type="button" role="radio" data-role="field_viewer" aria-checked="false">Field viewer</button>
+      <button type="button" role="radio" data-role="ops_engineer" aria-checked="false">Ops engineer</button>
+      <button type="button" role="radio" data-role="incident_commander" aria-checked="false">Incident commander</button>
+    </div>
+
+    <ul class="lamps" aria-label="System status">
+      <li class="lamp" id="lamp-itsm"><span class="dot" aria-hidden="true"></span><span class="lamp-name">ITSM link</span><span class="lamp-val">Checking</span></li>
+      <li class="lamp" id="lamp-circuit"><span class="dot" aria-hidden="true"></span><span class="lamp-name">Circuit</span><span class="lamp-val">Checking</span></li>
+      <li class="lamp" id="lamp-outbox"><span class="dot" aria-hidden="true"></span><span class="lamp-name">Outbox</span><span class="lamp-val">Checking</span></li>
+      <li class="lamp" id="lamp-token"><span class="dot" aria-hidden="true"></span><span class="lamp-name">Token refreshes</span><span class="lamp-val">0</span></li>
+    </ul>
+  </header>
+
+  <main class="deck">
+    <nav class="board" aria-labelledby="board-title">
+      <h2 id="board-title" class="panel-title">Incidents</h2>
+      <ol id="incident-list" class="incident-list"></ol>
+    </nav>
+
+    <section class="work" aria-label="Workspace">
+      <div class="tabs" role="tablist" aria-label="Workspace views">
+        <button type="button" role="tab" id="tab-triage" aria-controls="panel-triage" aria-selected="true">Triage</button>
+        <button type="button" role="tab" id="tab-query" aria-controls="panel-query" aria-selected="false" tabindex="-1">Query data</button>
+        <button type="button" role="tab" id="tab-search" aria-controls="panel-search" aria-selected="false" tabindex="-1">Search procedures</button>
+      </div>
+
+      <div id="panel-triage" role="tabpanel" aria-labelledby="tab-triage" class="tabpanel">
+        <p class="empty">Pick an incident to pull its telemetry, reconciled records, and the procedures that apply.</p>
+      </div>
+
+      <div id="panel-query" role="tabpanel" aria-labelledby="tab-query" class="tabpanel" hidden>
+        <p class="hint">Read-only SQL over the telemetry database. Writes, comments, and stacked statements are rejected, and results stop at 100 rows.</p>
+        <div class="presets" id="query-presets"></div>
+        <label class="field">
+          <span>SQL</span>
+          <textarea id="sql-input" rows="5" spellcheck="false">SELECT * FROM v_anomalous_historian_telemetry</textarea>
+        </label>
+        <div class="row">
+          <button type="button" class="btn btn-act" id="run-query">Run query</button>
+        </div>
+        <div id="query-result" aria-live="polite"></div>
+      </div>
+
+      <div id="panel-search" role="tabpanel" aria-labelledby="tab-search" class="tabpanel" hidden>
+        <p class="hint">Searches the SOP runbooks. Every result cites the exact section and line range.</p>
+        <form id="search-form" class="row">
+          <label class="field grow">
+            <span>Symptom or keyword</span>
+            <input id="search-input" type="search" value="PTU pressure hunting air entrainment" autocomplete="off">
+          </label>
+          <button type="submit" class="btn btn-act">Search</button>
+        </form>
+        <div id="search-result" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <aside class="side" aria-label="Resilience controls and activity">
+      <section class="block">
+        <h2 class="panel-title">Fault injection</h2>
+        <p class="hint">Breaks the mock ITSM so you can watch retries, token refresh, and the circuit breaker. Then create a work order.</p>
+        <div class="faults">
+          <button type="button" class="btn btn-fault" data-chaos='{"fail_next_429":2}'>Rate-limit next 2 calls</button>
+          <button type="button" class="btn btn-fault" data-chaos='{"fail_next_503":2}'>Make ITSM unavailable twice</button>
+          <button type="button" class="btn btn-fault" data-chaos='{"force_401_once":true}'>Expire the access token</button>
+          <button type="button" class="btn btn-fault btn-fault-hard" data-chaos='{"fail_next_500":12}'>Fail every call (trips circuit)</button>
+          <button type="button" class="btn btn-quiet" data-chaos='{"reset":true}'>Clear faults</button>
+        </div>
+        <p class="fault-status" id="fault-status" aria-live="polite"></p>
+      </section>
+
+      <section class="block">
+        <div class="block-head">
+          <h2 class="panel-title">Outbox</h2>
+          <button type="button" class="btn btn-act btn-small" id="replay-outbox">Replay queued</button>
+        </div>
+        <p class="hint">Work orders and escalations made while the circuit is open wait here instead of being lost.</p>
+        <ol id="outbox-list" class="outbox-list"></ol>
+        <p class="action-result" id="replay-result" aria-live="polite"></p>
+      </section>
+
+      <section class="block block-log">
+        <h2 class="panel-title">Activity log</h2>
+        <ol id="audit-list" class="audit-list" aria-live="off"></ol>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/console.js"></script>
+</body>
+</html>

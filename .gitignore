@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Generated runtime state (recreate with `python data/seed_db.py`)
+data/*.db
+data/audit.jsonl
+
+# Local secrets / machine-specific config (copy mcp_config.example.json to mcp_config.json)
+.env
+mcp_config.json
+mcp_config.local.json
+.claude/
+
+# OS
+.DS_Store

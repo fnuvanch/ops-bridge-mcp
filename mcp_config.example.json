@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ops-bridge-mcp": {
+      "command": "/absolute/path/to/ops-bridge-mcp/.venv/bin/python",
+      "args": [
+        "/absolute/path/to/ops-bridge-mcp/src/server.py"
+      ],
+      "env": {
+        "X_OPERATOR_ROLE": "ops_engineer",
+        "ITSM_API_URL": "http://127.0.0.1:8100",
+        "OPS_JWT_SECRET": "replace-with-output-of: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+      }
+    }
+  }
+}
