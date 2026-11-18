@@ -82,20 +82,43 @@ class ActionOutboxStore:
         payload: dict[str, Any],
         idempotency_key: str,
     ) -> dict[str, Any]:
-        """Persist a blocked mutating request into the outbox idempotently."""
+        """Persist a blocked mutating request into the outbox idempotently.
+
+        If the same idempotency key was queued before:
+        - PENDING: left as-is (``already_queued`` True).
+        - REPLAYED: ITSM already has it; the stored upstream result is returned as
+          ``result`` so callers can answer with that instead of claiming it was queued.
+        - DEAD_LETTER: an explicit retry by an operator re-arms it as PENDING.
+        """
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with self._connect() as conn:
             existing = conn.execute(
-                "SELECT outbox_id, status FROM outbox_actions WHERE idempotency_key = ?",
+                "SELECT outbox_id, status, result_json FROM outbox_actions WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
             if existing is not None:
-                return {
+                status = str(existing["status"])
+                entry: dict[str, Any] = {
                     "outbox_id": int(existing["outbox_id"]),
                     "idempotency_key": idempotency_key,
-                    "status": str(existing["status"]),
+                    "status": status,
                     "already_queued": True,
                 }
+                if status == "REPLAYED":
+                    entry["result"] = json.loads(existing["result_json"] or "{}")
+                elif status == "DEAD_LETTER":
+                    conn.execute(
+                        """
+                        UPDATE outbox_actions
+                        SET status = 'PENDING', attempts = 0, last_error = NULL,
+                            payload_json = ?, updated_at = ?
+                        WHERE idempotency_key = ?
+                        """,
+                        (json.dumps(payload), now, idempotency_key),
+                    )
+                    conn.commit()
+                    entry.update(status="PENDING", already_queued=False, requeued=True)
+                return entry
             cur = conn.execute(
                 """
                 INSERT INTO outbox_actions (

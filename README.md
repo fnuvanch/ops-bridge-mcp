@@ -1,8 +1,95 @@
-# `ops-bridge-mcp` — High-Compliance Manufacturing & Aviation Operations MCP Server
+# Ops Bridge MCP
 
-`ops-bridge-mcp` is a production-grade Model Context Protocol (MCP) server engineered for Forward Deployed Engineers (FDEs) operating in air-gapped or strictly regulated aerospace and manufacturing environments. It unifies structured operational telemetry, unstructured SOP runbooks, and mutating ITSM workflows behind a single RBAC-governed, fault-tolerant MCP interface.
+[![CI](https://github.com/fnuvanch/ops-bridge-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/fnuvanch/ops-bridge-mcp/actions/workflows/ci.yml)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB)
+![Runs offline](https://img.shields.io/badge/runs-fully%20offline-4CD07D)
+
+**A safe bridge between an AI assistant and an aircraft factory's operational systems.** It lets an LLM investigate production incidents (reading sensor data and maintenance procedures) and act on them (opening work orders, stopping an assembly line) with permission checks, audit logging, and failure handling built in.
+
+![Ops Console showing a SEV-1 avionics incident: sensor readings past their limits, the circuit breaker open after injected ITSM failures, and a work order waiting in the outbox](docs/console.png)
+
+*The Ops Console during a failure drill: three sensors are over their engineering limits, the ticketing system is failing, so the circuit breaker is open and a new work order is waiting safely in the outbox instead of being lost.*
 
 ---
+
+## In 60 seconds
+
+**The problem.** When a fault shows up on an aircraft assembly line, engineers piece together three things by hand: messy sensor and ERP records (duplicated, with gaps and mixed time zones), procedure manuals, and a ticketing system. An AI assistant could speed this up a lot, but giving an LLM access to production systems is risky. It might run a destructive query, open the same ticket five times while retrying, or take an action its user isn't allowed to take, like halting a line that costs about $45k an hour.
+
+**The solution.** A server built on the [Model Context Protocol](https://modelcontextprotocol.io) (MCP, the open standard that lets assistants such as Claude call external tools). It exposes six tools across three systems and puts guardrails around every one:
+
+| System | What the AI can do | Guardrails |
+|---|---|---|
+| Plant telemetry (SQLite) | Query sensor data and incident history | Read-only connection, SQL keyword filtering, 100-row cap, 2 s timeout |
+| Procedure manuals (Markdown SOPs) | Search for the right procedure | Every answer cites the exact section and line numbers |
+| Ticketing (ITSM REST API) | Open work orders, escalate line stoppages | Role-based permissions, duplicate-proof retries, circuit breaker, outbox for outages |
+
+**The Ops Console** is a web UI over the same tools, so people can see what the AI sees: incident triage, live sensor gauges, a role switcher to watch permissions apply, and buttons that break the ticketing system on purpose to show the system recovering.
+
+## What this project demonstrates
+
+| Skill | Where to look |
+|---|---|
+| Secure AI tool design: least privilege, role-based access, signed JWTs | [`src/auth.py`](src/auth.py) |
+| Defensive data access: read-only SQL guardrails for LLM-written queries | [`src/connectors/structured_db.py`](src/connectors/structured_db.py) |
+| Reliability engineering: idempotency, retries with backoff, circuit breaker, dead-letter outbox | [`src/resilience.py`](src/resilience.py), [`src/connectors/action_api.py`](src/connectors/action_api.py) |
+| Search without heavy ML: hybrid full-text + BM25 + n-gram vectors, fused by rank | [`src/connectors/knowledge_base.py`](src/connectors/knowledge_base.py) |
+| Data cleaning: de-duplicating records, recovering missing fields, normalizing time zones | [`src/connectors/structured_db.py`](src/connectors/structured_db.py) |
+| Full-stack UI: FastAPI backend, dependency-free JavaScript, accessible and responsive | [`console/`](console/) |
+| Testing: 58 automated tests plus a live end-to-end failure drill, both run in CI | [`tests/`](tests/), [`scripts/verify_live_stack.py`](scripts/verify_live_stack.py) |
+
+## Design decisions worth talking about
+
+- **The AI can lower its own permissions, never raise them.** Tool arguments come from the LLM, so they're untrusted. The server's configured role (or a signed JWT) sets the ceiling; a per-call `operator_role` can only narrow it.
+- **Retries can't create duplicate tickets.** Every write carries a deterministic key, `sha256(incident_id:action)`. However many times an agent retries, the ticketing system returns the original ticket.
+- **A bad request doesn't take the system down for everyone.** The circuit breaker opens after 3 upstream failures (timeouts, 5xx) but ignores 4xx client mistakes, so one malformed request can't lock out every other operator.
+- **Nothing is lost during an outage.** While the circuit is open, writes go to a persistent SQLite outbox and are replayed after recovery. Failures that will never succeed are dead-lettered instead of retried forever.
+- **Degrade, don't fail.** Triage queries the database and the manuals in parallel. If one is down, it returns what it has with a clear warning.
+- **Runs fully offline.** No cloud APIs, embedding services, or CDN assets, which suits air-gapped plants. Search is plain Python on a 16 GB laptop.
+
+## Hardening pass
+
+A security and correctness review of the first version found and fixed these issues, each now pinned by a regression test ([`tests/test_regressions.py`](tests/test_regressions.py)):
+
+| Severity | Issue | Fix |
+|---|---|---|
+| Critical | Any MCP client could act as `incident_commander` by passing `operator_role` in a tool call | That argument can now only narrow the trusted role |
+| Critical | A JWT signing secret was hard-coded, so anyone reading the source could forge tokens | No default secret; tokens fail closed and the issuer is verified |
+| High | One client's 404s could open the shared circuit breaker | 4xx responses no longer count as upstream failures |
+| High | Failed outbox items retried forever; replay during an outage burned retries | Dead-letter queue, and replay waits while the circuit is open |
+| Medium | Retrying an already-delivered write during an outage was reported as "queued" | It now returns the original ticket |
+| Medium | Safe SQL was rejected (`replace()`, keywords inside strings) and some `LIMIT` forms crashed | String-aware checks and robust `LIMIT` handling |
+| Low | Duplicate records merged by insert order; one bad timestamp crashed triage | Freshest record wins; malformed timestamps are tolerated |
+
+## Try it in two minutes
+
+```bash
+git clone https://github.com/fnuvanch/ops-bridge-mcp.git
+cd ops-bridge-mcp
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+python data/seed_db.py      # build the demo telemetry database
+python -m console           # open http://127.0.0.1:8300
+```
+
+Then, in the console:
+1. Pick **INC-2026-0891**: two conflicting source records have been merged, and three sensors are over their limits.
+2. Switch to **Field viewer** and try **Create work order**: it's blocked.
+3. Switch to **Ops engineer**, create the work order, then click again: the same ticket comes back, no duplicate.
+4. Click **Fail every call**, then create work orders on three other incidents: the circuit opens and the next one waits in the outbox.
+5. Click **Clear faults**, wait for the countdown, and click **Replay queued**.
+
+Run the test suite with `pytest`, or the end-to-end drill over a real MCP connection with `python scripts/verify_live_stack.py`.
+
+## Tech stack
+
+Python 3.11+, MCP Python SDK, FastAPI, httpx, Pydantic, SQLite (FTS5), rank-bm25, PyJWT, pytest; vanilla JavaScript and CSS for the console; GitHub Actions for CI.
+
+---
+
+# Technical deep dive
+
+`ops-bridge-mcp` is an MCP server for Forward Deployed Engineers working in air-gapped or strictly regulated aerospace and manufacturing environments. It unifies structured operational telemetry, unstructured SOP runbooks, and mutating ITSM workflows behind a single RBAC-governed, fault-tolerant MCP interface.
 
 ## 1. Operational Problem Statement
 In Final Assembly Line (FAL) and Part-145 aircraft maintenance operations, incident triage spans three fragmented planes:
@@ -96,6 +183,8 @@ Unauthorized invocations return a structured `RBAC_FORBIDDEN` MCP error payload 
 ```text
 ops-bridge-mcp/
 ├── pyproject.toml
+├── .github/workflows/ci.yml     # Tests + live MCP drill on Python 3.11 and 3.12
+├── docs/console.png
 ├── mcp_config.example.json      # MCP client host config template (copy to mcp_config.json)
 ├── README.md
 ├── mock_itsm_api/
@@ -124,8 +213,9 @@ ops-bridge-mcp/
 
 ### Quickstart & Verification
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
+# Create a virtual environment and install (with test dependencies)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 
 # 1. Seed SQLite operational DB (dirty telemetry, historian_rollups & FTS5 runbook index)
 python data/seed_db.py

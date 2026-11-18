@@ -75,6 +75,42 @@ def configure_connectors(
         action_connector = action
 
 
+
+def _already_delivered_response(
+    *,
+    tool_name: str,
+    result_field: str,
+    outbox_entry: dict[str, Any],
+    incident_id: str,
+    role: str,
+    operator_id: str,
+    trace_id: str,
+    started: float,
+) -> dict[str, Any]:
+    """Answer a circuit-open retry whose idempotency key the outbox already delivered.
+
+    ITSM already holds this ticket, so return it as an idempotent replay rather than
+    telling the operator it was queued.
+    """
+    ticket = {**outbox_entry.get("result", {}), "idempotent_replay": True}
+    log_audit_event(
+        tool_name=tool_name,
+        operator_role=role,
+        operator_id=operator_id,
+        rbac_decision="ALLOW",
+        latency_ms=(time.perf_counter() - started) * 1000.0,
+        status="OK",
+        trace_id=trace_id,
+        metadata={
+            "incident_id": incident_id,
+            "ticket_id": ticket.get("ticket_id"),
+            "idempotent_replay": True,
+            "served_from": "outbox",
+        },
+    )
+    return {"status": "OK", "trace_id": trace_id, "operator_role": role, result_field: ticket}
+
+
 @mcp.tool()
 async def query_telemetry(
     sql: str,
@@ -427,6 +463,17 @@ async def create_work_order(
             },
             idempotency_key=validated_key,
         )
+        if outbox_entry["status"] == "REPLAYED":
+            return _already_delivered_response(
+                tool_name="create_work_order",
+                result_field="work_order",
+                outbox_entry=outbox_entry,
+                incident_id=incident_id,
+                role=role,
+                operator_id=operator_id,
+                trace_id=trace_id,
+                started=started,
+            )
         latency_ms = (time.perf_counter() - started) * 1000.0
         log_audit_event(
             tool_name="create_work_order",
@@ -562,6 +609,17 @@ async def escalate_line_stoppage(
             },
             idempotency_key=validated_key,
         )
+        if outbox_entry["status"] == "REPLAYED":
+            return _already_delivered_response(
+                tool_name="escalate_line_stoppage",
+                result_field="escalation",
+                outbox_entry=outbox_entry,
+                incident_id=incident_id,
+                role=role,
+                operator_id=operator_id,
+                trace_id=trace_id,
+                started=started,
+            )
         latency_ms = (time.perf_counter() - started) * 1000.0
         log_audit_event(
             tool_name="escalate_line_stoppage",

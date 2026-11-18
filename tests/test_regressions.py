@@ -292,3 +292,71 @@ async def test_mock_idempotency_scoped_per_endpoint(env) -> None:
     assert wo["ticket_type"] == "WORK_ORDER"
     assert esc["ticket_type"] == "LINE_STOPPAGE_ESCALATION"
     assert esc["idempotent_replay"] is False
+
+
+# --- Outbox re-entry: a key already delivered must not be reported as "queued" -------
+
+
+def test_outbox_enqueue_reentry_semantics(tmp_path: Path) -> None:
+    from src.connectors.action_api import ActionOutboxStore
+
+    store = ActionOutboxStore(db_path=tmp_path / "o.db")
+    first = store.enqueue(action_type="create_work_order", payload={"v": 1}, idempotency_key="key-reentry-01")
+    assert first["already_queued"] is False
+
+    again = store.enqueue(action_type="create_work_order", payload={"v": 1}, idempotency_key="key-reentry-01")
+    assert again["already_queued"] is True and again["status"] == "PENDING"
+
+    store.mark_replayed("key-reentry-01", {"ticket_id": "WO-ITSM-1", "idempotent_replay": False})
+    delivered = store.enqueue(action_type="create_work_order", payload={"v": 1}, idempotency_key="key-reentry-01")
+    assert delivered["status"] == "REPLAYED"
+    assert delivered["result"]["ticket_id"] == "WO-ITSM-1"
+
+    store.enqueue(action_type="create_work_order", payload={"v": 1}, idempotency_key="key-dead-01")
+    store.mark_attempt_failed("key-dead-01", "HTTP 500", permanent=True)
+    rearmed = store.enqueue(action_type="create_work_order", payload={"v": 2}, idempotency_key="key-dead-01")
+    assert rearmed["status"] == "PENDING" and rearmed.get("requeued") is True
+    pending = store.list_pending()
+    assert [p["idempotency_key"] for p in pending] == ["key-dead-01"]
+    assert pending[0]["attempts"] == 0 and pending[0]["payload"] == {"v": 2}
+
+
+@pytest.mark.asyncio
+async def test_circuit_open_retry_of_delivered_key_returns_original_ticket(tmp_path: Path) -> None:
+    from src.server import create_work_order
+
+    fake_now = [900.0]
+    reset_itsm_state()
+    cb = CircuitBreaker(name="reentry", failure_threshold=1, recovery_timeout=15.0, time_fn=lambda: fake_now[0])
+    action_conn = ActionAPIConnector(
+        base_url="http://mock-itsm.test",
+        transport=httpx.ASGITransport(app=itsm_app),
+        circuit_breaker=cb,
+        token_manager=OAuthTokenManager(initial_token="expired-bootstrap-token"),
+        max_retries=0,
+        outbox_db_path=tmp_path / "outbox.db",
+    )
+    configure_connectors(action=action_conn)
+    key = compute_idempotency_key("INC-2026-0891", "create_work_order")
+    args = dict(incident_id="INC-2026-0891", title="t", priority="P1", work_center="WC", idempotency_key=key)
+
+    with operator_context("ops_engineer"):
+        # Trip the breaker, queue the work order, recover, replay it.
+        ITSM_STATE.chaos["fail_next_500"] = 1
+        await create_work_order(**{**args, "incident_id": "INC-TRIP", "idempotency_key": "trip-key-000001"})
+        assert (await create_work_order(**args))["outbox_queued"] is True
+        fake_now[0] += 16
+        assert (await replay_outbox_actions())["replayed_count"] == 1
+        original_ticket = action_conn.outbox.list_recent(1)[0]
+
+        # Trip again and retry the same work order: ITSM already has it.
+        ITSM_STATE.chaos["fail_next_500"] = 1
+        await create_work_order(**{**args, "incident_id": "INC-TRIP-2", "idempotency_key": "trip-key-000002"})
+        assert cb.state == CircuitState.OPEN
+        res = await create_work_order(**args)
+
+    assert res["status"] == "OK"
+    assert res["work_order"]["idempotent_replay"] is True
+    assert res["work_order"]["ticket_id"].startswith("WO-ITSM-")
+    assert original_ticket["status"] == "REPLAYED"
+    assert action_conn.outbox.list_pending() == []
